@@ -291,8 +291,12 @@ Returns `true` if the certificate exists and has not been revoked. The `get_cert
 | `certificate_revoked` | `certificate_id` | Certificate revoked |
 | `course_certificates_revoked` | `(admin, course_id, revoked_count, ledger)` | All certificates of a course bulk-revoked |
 | `admin_transferred` | `new_admin` | Admin role transferred |
+| `refund_requested` | `(student, course_id, amount_paid)` | Student requests a refund |
+| `refund_processed` | `(student, course_id, approved, admin)` | Admin approves or rejects a refund request |
+| `dispute_escalated` | `(caller, course_id, fee_paid)` | Student escalates a dispute to arbitration |
+| `arbitration_resolved` | `ArbitrationResolved { case_id, course_id, caller, instructor, outcome, fee_paid, resolved_by, resolved_at_ledger }` | Admin resolves an open arbitration case. The outcome is `ResolvedForStudent` or `ResolvedForInstructor`; the event topic also carries `case_id` and `resolved_for_student` / `resolved_for_instructor` so indexers can filter by outcome |
 
-The backend listens to these events and updates the database, sends notifications, and triggers email confirmations.
+The backend listens to these events and updates the database, sends notifications, and triggers email confirmations. In particular, `arbitration_resolved` lets the backend notify both the student and the instructor and update the dispute status shown in the UI.
 
 ---
 

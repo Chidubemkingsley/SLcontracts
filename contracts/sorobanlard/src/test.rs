@@ -10671,11 +10671,53 @@ fn setup_arbitration(
     fee_per_case: i128,
 ) -> Address {
     client.set_arbitration_fee_config(admin, &fee_per_case);
-    register_and_approve_course(env, client, token_id, admin, instructor, course_id, 1_000_000_000);
+    register_and_approve_course(
+        env,
+        client,
+        token_id,
+        admin,
+        instructor,
+        course_id,
+        1_000_000_000,
+    );
     let student = Address::generate(env);
     token::StellarAssetClient::new(env, token_id).mint(&student, &100_000_000_000);
     client.enroll(&student, &String::from_str(env, course_id));
     student
+}
+
+/// Returns the outcome topic and payload of the single
+/// `arbitration_resolved` event emitted by `contract_id`.
+fn get_arbitration_resolved_event(
+    env: &Env,
+    contract_id: &Address,
+) -> (Symbol, ArbitrationResolved) {
+    let mut found: Option<(Symbol, ArbitrationResolved)> = None;
+    let mut count = 0u32;
+
+    for (contract, topics, data) in env.events().all().iter() {
+        if contract != *contract_id {
+            continue;
+        }
+
+        let topic_name: Symbol = topics.get(0).unwrap().try_into_val(env).unwrap();
+        if topic_name != Symbol::new(env, "arbitration_resolved") {
+            continue;
+        }
+
+        count += 1;
+        assert_eq!(
+            topics.len(),
+            3,
+            "arbitration_resolved must index case_id and outcome"
+        );
+        let outcome: Symbol = topics.get(2).unwrap().try_into_val(env).unwrap();
+        let payload: ArbitrationResolved = data.try_into_val(env).unwrap();
+        found = Some((outcome, payload));
+    }
+
+    assert_eq!(count, 1, "expected exactly one arbitration_resolved event");
+    found.unwrap()
 }
 
 /// #255 — escalate_to_arbitration() must persist a queryable ArbitrationCase record.
@@ -10687,7 +10729,13 @@ fn test_escalation_creates_retrievable_arbitration_case() {
     let fee_per_case = 5_000_000i128;
     let course_id_str = "COURSE-ARB-255";
     let student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, course_id_str, fee_per_case,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        course_id_str,
+        fee_per_case,
     );
     let course_id = String::from_str(&env, course_id_str);
 
@@ -10697,10 +10745,20 @@ fn test_escalation_creates_retrievable_arbitration_case() {
         .get_arbitration_case(&student, &course_id)
         .expect("arbitration case must be retrievable after escalation");
 
-    assert_eq!(case.caller, student, "case must record the escalating student");
+    assert_eq!(
+        case.caller, student,
+        "case must record the escalating student"
+    );
     assert_eq!(case.course_id, course_id, "case must record the course id");
-    assert_eq!(case.fee_paid, fee_per_case, "fee_paid must match config.fee_per_case");
-    assert_eq!(case.status, DisputeStatus::Open, "newly created case must be Open");
+    assert_eq!(
+        case.fee_paid, fee_per_case,
+        "fee_paid must match config.fee_per_case"
+    );
+    assert_eq!(
+        case.status,
+        DisputeStatus::Open,
+        "newly created case must be Open"
+    );
 }
 
 /// #257 — a second escalation for the same (student, course_id) must be rejected.
@@ -10711,7 +10769,13 @@ fn test_duplicate_escalation_rejected() {
     let client = SorobanLardContractClient::new(&env, &contract_id);
 
     let student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-257", 5_000_000,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-257",
+        5_000_000,
     );
     let course_id = String::from_str(&env, "COURSE-ARB-257");
 
@@ -10722,6 +10786,49 @@ fn test_duplicate_escalation_rejected() {
     client.escalate_to_arbitration(&student, &course_id);
 }
 
+/// resolve_arbitration() must emit a distinct, documented event carrying the
+/// case_id and outcome so off-chain systems can notify both parties and update
+/// the dispute status in the UI.
+#[test]
+fn test_resolve_arbitration_emits_event_with_case_id_and_outcome() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let fee_per_case = 5_000_000i128;
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-EVENT",
+        fee_per_case,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-EVENT");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    env.mock_all_auths_allowing_non_root_auth();
+    client.resolve_arbitration(&admin, &student, &course_id, &true);
+    let resolution_ledger = env.ledger().sequence();
+
+    let (outcome_topic, event) = get_arbitration_resolved_event(&env, &contract_id);
+
+    assert_eq!(
+        outcome_topic,
+        Symbol::new(&env, "resolved_for_student"),
+        "event topic must distinguish a student-win outcome"
+    );
+    assert_eq!(event.case_id, course_id, "event must carry case_id");
+    assert_eq!(event.course_id, course_id);
+    assert_eq!(event.caller, student);
+    assert_eq!(event.instructor, instructor);
+    assert_eq!(event.outcome, DisputeStatus::ResolvedForStudent);
+    assert_eq!(event.fee_paid, fee_per_case);
+    assert_eq!(event.resolved_by, admin);
+    assert_eq!(event.resolved_at_ledger, resolution_ledger);
+}
+
 /// #256 — resolve_arbitration() with for_student=true must refund the fee to the caller.
 #[test]
 fn test_resolve_arbitration_refund_to_student() {
@@ -10730,7 +10837,13 @@ fn test_resolve_arbitration_refund_to_student() {
 
     let fee_per_case = 5_000_000i128;
     let student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-REFUND", fee_per_case,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-REFUND",
+        fee_per_case,
     );
     let course_id = String::from_str(&env, "COURSE-ARB-REFUND");
 
@@ -10759,7 +10872,13 @@ fn test_resolve_arbitration_payout_to_instructor() {
 
     let fee_per_case = 5_000_000i128;
     let student = setup_arbitration(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-ARB-PAYOUT", fee_per_case,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-PAYOUT",
+        fee_per_case,
     );
     let course_id = String::from_str(&env, "COURSE-ARB-PAYOUT");
 
@@ -10768,6 +10887,11 @@ fn test_resolve_arbitration_payout_to_instructor() {
     let instr_balance_before = token::Client::new(&env, &token_id).balance(&instructor);
     env.mock_all_auths_allowing_non_root_auth();
     client.resolve_arbitration(&admin, &student, &course_id, &false);
+
+    // Check events before the next contract invocation; the test harness only
+    // retains events from the most recent invocation.
+    let (outcome_topic, event) = get_arbitration_resolved_event(&env, &contract_id);
+
     let instr_balance_after = token::Client::new(&env, &token_id).balance(&instructor);
 
     assert_eq!(
@@ -10775,9 +10899,66 @@ fn test_resolve_arbitration_payout_to_instructor() {
         fee_per_case,
         "instructor must receive the arbitration fee on an instructor-win resolution"
     );
+    assert_eq!(
+        outcome_topic,
+        Symbol::new(&env, "resolved_for_instructor"),
+        "event topic must distinguish an instructor-win outcome"
+    );
+    assert_eq!(event.case_id, course_id);
+    assert_eq!(event.outcome, DisputeStatus::ResolvedForInstructor);
 
     let case = client.get_arbitration_case(&student, &course_id).unwrap();
     assert_eq!(case.status, DisputeStatus::ResolvedForInstructor);
+}
+
+/// An open refund request must block escalation of the same dispute to formal
+/// arbitration. Allowing both paths to run concurrently could resolve the same
+/// enrollment twice.
+#[test]
+#[should_panic(expected = "refund request pending for this dispute")]
+fn test_open_refund_request_blocks_arbitration_escalation() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-REFUND-BLOCK",
+        5_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-REFUND-BLOCK");
+
+    client.request_refund(&student, &course_id);
+
+    // Must panic: the informal refund path is still pending.
+    client.escalate_to_arbitration(&student, &course_id);
+}
+
+/// An open arbitration case must block a refund request for the same dispute.
+#[test]
+#[should_panic(expected = "arbitration case open for this dispute")]
+fn test_open_arbitration_case_blocks_refund_request() {
+    let (env, contract_id, token_id, admin, _sec_admin, _treasury, instructor) = setup();
+    let client = SorobanLardContractClient::new(&env, &contract_id);
+
+    let student = setup_arbitration(
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-ARB-REFUND-BLOCK-2",
+        5_000_000,
+    );
+    let course_id = String::from_str(&env, "COURSE-ARB-REFUND-BLOCK-2");
+
+    client.escalate_to_arbitration(&student, &course_id);
+
+    // Must panic: the formal arbitration path is still open.
+    client.request_refund(&student, &course_id);
 }
 
 // ============================================================
@@ -10795,13 +10976,21 @@ fn test_process_refund_archives_enrollment_to_history() {
     token::StellarAssetClient::new(&env, &token_id).mint(&student, &100_000_000_000);
 
     register_and_approve_course(
-        &env, &client, &token_id, &admin, &instructor, "COURSE-REFUND-ARCHIVE", 1_000_000_000,
+        &env,
+        &client,
+        &token_id,
+        &admin,
+        &instructor,
+        "COURSE-REFUND-ARCHIVE",
+        1_000_000_000,
     );
     let course_id = String::from_str(&env, "COURSE-REFUND-ARCHIVE");
 
     // Capture the amount paid at enrollment.
     client.enroll(&student, &course_id);
-    let enrollment = client.get_enrollment(&student, &student, &course_id).unwrap();
+    let enrollment = client
+        .get_enrollment(&student, &student, &course_id)
+        .unwrap();
     let amount_paid = enrollment.amount_paid;
     assert!(amount_paid > 0);
 
@@ -10812,14 +11001,20 @@ fn test_process_refund_archives_enrollment_to_history() {
 
     // The active enrollment must no longer exist.
     assert!(
-        client.get_enrollment(&student, &student, &course_id).is_none(),
+        client
+            .get_enrollment(&student, &student, &course_id)
+            .is_none(),
         "active enrollment must be removed after refund"
     );
 
     // The history must contain exactly one entry with is_refunded=true.
     let history = client.get_enrollment_history(&admin, &student, &course_id);
 
-    assert_eq!(history.len(), 1, "history must contain exactly one archived entry");
+    assert_eq!(
+        history.len(),
+        1,
+        "history must contain exactly one archived entry"
+    );
     let archived = history.get(0).unwrap();
     assert!(
         archived.is_refunded,
@@ -10831,4 +11026,38 @@ fn test_process_refund_archives_enrollment_to_history() {
     );
     assert_eq!(archived.student, student);
     assert_eq!(archived.course_id, course_id);
+}
+
+// ============================================================
+// STORAGE-KEY VARIANT BUDGET
+// ============================================================
+
+/// Keep the documented `DataKey` / `DataKey2` variant counts honest.
+///
+/// `DataKey` is at its 50-variant XDR cap and must not grow; new keys belong
+/// in `DataKey2` (singleton) or a standalone composite key struct. The counts
+/// here are derived from the enum definitions by `contract_data_key!`, so this
+/// test fails whenever a variant is added or removed without updating the
+/// storage-key documentation and split.
+#[test]
+fn test_data_key_variant_budgets_are_exact_and_documented() {
+    assert_eq!(
+        DataKey::VARIANT_COUNT,
+        50,
+        "DataKey is at the 50-variant cap"
+    );
+    assert_eq!(DataKey::VARIANT_LIMIT, DATA_KEY_VARIANT_LIMIT);
+    assert_eq!(
+        DataKey::VARIANT_HEADROOM,
+        0,
+        "DataKey has no room for new variants; use DataKey2 or a struct key"
+    );
+
+    assert_eq!(DataKey2::VARIANT_COUNT, 2);
+    assert_eq!(DataKey2::VARIANT_LIMIT, DATA_KEY_VARIANT_LIMIT);
+    assert_eq!(
+        DataKey2::VARIANT_HEADROOM,
+        48,
+        "DataKey2 comment must state the exact remaining headroom"
+    );
 }

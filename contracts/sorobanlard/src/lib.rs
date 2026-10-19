@@ -173,6 +173,36 @@ pub struct ArbitrationCase {
     pub status: DisputeStatus,
 }
 
+/// Emitted when an arbitration case is resolved.
+///
+/// Topic layout:
+/// `(arbitration_resolved, case_id, resolved_for_student|resolved_for_instructor)`.
+///
+/// The outcome is repeated in the payload so an indexer that only persists
+/// event data can still notify both parties and update dispute status in the
+/// UI. `case_id` is the stable identifier of the dispute (currently derived
+/// from the caller and course pair).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArbitrationResolved {
+    /// Unique case identifier for the dispute.
+    pub case_id: String,
+    /// Course the dispute concerns.
+    pub course_id: String,
+    /// Student who escalated the dispute.
+    pub caller: Address,
+    /// Instructor of the course when the case was opened.
+    pub instructor: Address,
+    /// Final outcome: `ResolvedForStudent` or `ResolvedForInstructor`.
+    pub outcome: DisputeStatus,
+    /// Arbitration fee disbursed when the case was resolved.
+    pub fee_paid: i128,
+    /// Admin that resolved the case.
+    pub resolved_by: Address,
+    /// Ledger sequence when the case was resolved.
+    pub resolved_at_ledger: u32,
+}
+
 /// Configuration for risk-based fee surcharges.
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -451,136 +481,216 @@ pub struct InstructorStats {
 // STORAGE KEYS
 // ============================================================
 
-#[contracttype]
-pub enum DataKey {
-    /// Course record by course ID
-    Course(String),
-    /// Immutable instructor address recorded at registration time
-    CourseInstructorRef(String),
-    /// Enrollment record by (student_address, course_id)
-    Enrollment(Address, String),
-    /// Certificate record by certificate ID
-    Certificate(String),
-    /// Admin address — set at init, can approve courses and issue certificates
-    Admin,
-    /// Secondary admin address for multi-sig operations
-    SecondaryAdmin,
-    /// Optional ledger sequence when the admin role expires
-    AdminExpiresAt,
-    /// Platform treasury address — receives the platform fee share
-    Treasury,
-    /// Platform default fee percentage (overrideable per course)
-    DefaultFee,
-    /// Pending platform treasury address and effective ledger sequence
-    PendingTreasury,
-    /// Whitelisted token contract address (used to validate course tokens)
-    ApprovedToken(Address),
-    /// Pending new admin address — must call accept_admin() to take effect
-    PendingAdmin,
-    /// Pending new secondary admin address
-    PendingSecondaryAdmin,
-    /// Platform paused state flag
-    PlatformPaused,
-    /// Accumulated instructor earnings per (instructor, token) pair (in stroops)
-    InstructorEarnings(Address, Address),
-    /// Accumulated instructor earnings across all tokens (in stroops)
-    InstructorTotalEarnings(Address),
-    /// Number of courses registered by an instructor
-    InstructorCourseCount(Address),
-    /// Number of currently pending courses for an instructor
-    InstructorPendingCourseCount(Address),
-    /// Ordered list of course IDs registered by a specific instructor
-    /// (append-only — course status changes never remove an entry).
-    InstructorCourseList(Address),
-    /// Maximum number of courses an instructor can register
-    MaxCoursesPerInstructor,
-    /// Minimum ledger sequences required between course registration and approval
-    MinReviewDelay,
-    /// Default minimum ledger sequences required between enroll() and
-    /// mark_completed() for newly-registered courses (admin-configurable).
-    DefaultMinCompletionLedgers,
-    /// Refund window delay in ledger sequences
-    RefundWindow,
-    /// Refund request record by (student_address, course_id)
-    RefundRequest(Address, String),
-    /// Blocklist of instructor addresses who are frozen
-    InstructorBlocked(Address),
-    /// Ordered list of all registered course IDs (on-chain catalog)
-    CourseList,
-    /// Archived past `Enrollment` records for a (student, course_id) pair,
-    /// preserved when a completed student re-enrolls via `re_enroll()`.
-    EnrollmentHistory(Address, String),
-    /// Aggregate reputation stats for an instructor (total students,
-    /// completions, certificates issued) — see `InstructorStats`.
-    InstructorStats(Address),
-    /// Blocklist of student addresses who are banned from the platform
-    StudentBlocked(Address),
-    /// Per-token fee configuration (maps token address → FeeConfig)
-    FeeConfig(Address),
-    /// Arbitration fee configuration
-    ArbitrationFeeConfig,
-    /// Risk fee configuration for surcharge pricing
-    RiskFeeConfig,
-    /// Flag indicating whether risk-based fee pricing is enabled
-    RiskConfigEnabled,
-    /// Total active enrollments across all courses platform-wide
-    TotalActiveEnrollments,
-    /// Maximum total active enrollments allowed platform-wide
-    PlatformEnrollmentCap,
-    /// A proposed contract Wasm upgrade awaiting its time-lock, if any.
-    PendingUpgrade,
-    /// Configurable time-lock (in ledger sequences) that must elapse
-    /// between an upgrade proposal and its execution.
-    UpgradeTimelock,
-    /// Waitlist for a course - ordered list of student addresses waiting for enrollment
-    CourseWaitlist(String),
-    /// Global registry of all instructor addresses who have registered courses
-    InstructorRegistry,
-    /// Archived course records by course ID, stored to enforce cooldown
-    /// period before the same course ID can be re-registered.
-    ArchivedCourse(String),
-    /// Configurable challenge period (in ledger sequences) after which
-    /// a pending certificate revocation becomes permanent.
-    RevocationChallengePeriod,
-    /// Ordered (append-only) list of certificate IDs issued for a course.
-    /// Populated by `issue_certificate` and consumed by course-wide bulk
-    /// operations such as `bulk_revoke_course_certificates()`.
-    CourseCertificates(String),
-    /// Mapping from enrollment_reference (unique ID) to (student, course_id)
-    /// Used by issue_certificate to look up enrollments without a caller-supplied course_id.
-    EnrollmentByRef(String),
-    /// Counter for generating unique enrollment references
-    EnrollmentRefCounter,
-    /// Global registry of approver addresses with course approval authority
-    Approver(Address),
-    /// Ledger sequence when init() was called — used to enforce
-    /// a governance window before approve_course() can be called.
-    InitLedger,
-    /// Ledger sequence of the last successful transfer_admin() call.
-    /// Used to enforce a minimum cooldown between consecutive admin key
-    /// rotations, preventing rapid-rotation attacks after a compromise.
-    LastAdminTransferLedger,
-    /// Per-course consecutive enrollment failure counter.
-    /// Incremented each time enroll_internal() panics due to a token
-    /// transfer failure for a specific course. Reset to 0 on a successful
-    /// enrollment. When the count reaches CIRCUIT_BREAKER_THRESHOLD the
-    /// course is automatically paused.
-    CourseFailureCount(String),
-    /// Tokens classified as BTC/ETH-denominated for risk-surcharge pricing.
-    BtcEthToken(Address),
-    /// Lifetime enrollment count per student (new-customer risk flag).
-    StudentEnrollmentCount(Address),
+/// Maximum number of variants permitted in a single `#[contracttype]` enum.
+///
+/// Soroban's XDR representation for contract-type enums supports at most 50
+/// variants. `DataKey` has reached that cap, which is why overflow keys live
+/// in `DataKey2` and why new composite keys use standalone key structs (see
+/// `docs/storage-keys.md`).
+pub const DATA_KEY_VARIANT_LIMIT: u32 = 50;
+
+/// Defines a `#[contracttype]` storage-key enum and derives its variant budget.
+///
+/// Keeping the count in a macro (rather than only in a hand-maintained comment)
+/// means adding a variant automatically updates `VARIANT_COUNT`, and the
+/// compile-time assertions after the enum definitions fail the build as soon as
+/// an enum exceeds `DATA_KEY_VARIANT_LIMIT`.
+macro_rules! contract_data_key {
+    (
+        $(#[$enum_meta:meta])*
+        $vis:vis enum $name:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident $(($($variant_ty:tt)*))?
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$enum_meta])*
+        #[contracttype]
+        $vis enum $name {
+            $(
+                $(#[$variant_meta])*
+                $variant $(($($variant_ty)*))?
+            ),*
+        }
+
+        impl $name {
+            /// Exact number of variants in this enum, derived from its definition.
+            pub const VARIANT_COUNT: u32 = 0u32 $(+ {
+                let _ = stringify!($variant);
+                1u32
+            })*;
+
+            /// Maximum number of variants allowed by the XDR encoding.
+            pub const VARIANT_LIMIT: u32 = DATA_KEY_VARIANT_LIMIT;
+
+            /// Number of additional variants that can still be added safely.
+            pub const VARIANT_HEADROOM: u32 =
+                Self::VARIANT_LIMIT.saturating_sub(Self::VARIANT_COUNT);
+        }
+    };
 }
 
-/// Overflow keys split out to avoid the #[contracttype] variant-count limit.
-#[contracttype]
-pub enum DataKey2 {
-    /// Threshold price (in stroops) above which a course is "high-value"
-    /// and requires co-signature from two different admins to approve
-    HighValueCourseThreshold,
-    /// Stores the first approver's address for a high-value course pending co-signature
-    HighValueCourseApproval(String),
+contract_data_key! {
+    /// Primary persistent-storage keys for the contract.
+    ///
+    /// # Variant budget
+    ///
+    /// Soroban caps a single `#[contracttype]` enum at `DATA_KEY_VARIANT_LIMIT`
+    /// (50) variants. Current usage: **50 / 50 variants, 0 headroom** — this
+    /// enum is full. Do not add new variants here.
+    ///
+    /// - New *composite* keys must use a standalone `#[contracttype]` key
+    ///   struct (for example `ArbitrationCaseKey`) stored directly.
+    /// - New *singleton* keys may be added to `DataKey2`, which has headroom.
+    ///
+    /// Tuple-style variants such as `Enrollment(Address, String)` are retained
+    /// for keys already written on-chain and are not a pattern to copy for new
+    /// keys. See `docs/storage-keys.md` for the full decision guide.
+    pub enum DataKey {
+        /// Course record by course ID
+        Course(String),
+        /// Immutable instructor address recorded at registration time
+        CourseInstructorRef(String),
+        /// Enrollment record by (student_address, course_id)
+        Enrollment(Address, String),
+        /// Certificate record by certificate ID
+        Certificate(String),
+        /// Admin address — set at init, can approve courses and issue certificates
+        Admin,
+        /// Secondary admin address for multi-sig operations
+        SecondaryAdmin,
+        /// Optional ledger sequence when the admin role expires
+        AdminExpiresAt,
+        /// Platform treasury address — receives the platform fee share
+        Treasury,
+        /// Platform default fee percentage (overrideable per course)
+        DefaultFee,
+        /// Pending platform treasury address and effective ledger sequence
+        PendingTreasury,
+        /// Whitelisted token contract address (used to validate course tokens)
+        ApprovedToken(Address),
+        /// Pending new admin address — must call accept_admin() to take effect
+        PendingAdmin,
+        /// Pending new secondary admin address
+        PendingSecondaryAdmin,
+        /// Platform paused state flag
+        PlatformPaused,
+        /// Accumulated instructor earnings per (instructor, token) pair (in stroops)
+        InstructorEarnings(Address, Address),
+        /// Accumulated instructor earnings across all tokens (in stroops)
+        InstructorTotalEarnings(Address),
+        /// Number of courses registered by an instructor
+        InstructorCourseCount(Address),
+        /// Number of currently pending courses for an instructor
+        InstructorPendingCourseCount(Address),
+        /// Ordered list of course IDs registered by a specific instructor
+        /// (append-only — course status changes never remove an entry).
+        InstructorCourseList(Address),
+        /// Maximum number of courses an instructor can register
+        MaxCoursesPerInstructor,
+        /// Minimum ledger sequences required between course registration and approval
+        MinReviewDelay,
+        /// Default minimum ledger sequences required between enroll() and
+        /// mark_completed() for newly-registered courses (admin-configurable).
+        DefaultMinCompletionLedgers,
+        /// Refund window delay in ledger sequences
+        RefundWindow,
+        /// Refund request record by (student_address, course_id)
+        RefundRequest(Address, String),
+        /// Blocklist of instructor addresses who are frozen
+        InstructorBlocked(Address),
+        /// Ordered list of all registered course IDs (on-chain catalog)
+        CourseList,
+        /// Archived past `Enrollment` records for a (student, course_id) pair,
+        /// preserved when a completed student re-enrolls via `re_enroll()`.
+        EnrollmentHistory(Address, String),
+        /// Aggregate reputation stats for an instructor (total students,
+        /// completions, certificates issued) — see `InstructorStats`.
+        InstructorStats(Address),
+        /// Blocklist of student addresses who are banned from the platform
+        StudentBlocked(Address),
+        /// Per-token fee configuration (maps token address → FeeConfig)
+        FeeConfig(Address),
+        /// Arbitration fee configuration
+        ArbitrationFeeConfig,
+        /// Risk fee configuration for surcharge pricing
+        RiskFeeConfig,
+        /// Flag indicating whether risk-based fee pricing is enabled
+        RiskConfigEnabled,
+        /// Total active enrollments across all courses platform-wide
+        TotalActiveEnrollments,
+        /// Maximum total active enrollments allowed platform-wide
+        PlatformEnrollmentCap,
+        /// A proposed contract Wasm upgrade awaiting its time-lock, if any.
+        PendingUpgrade,
+        /// Configurable time-lock (in ledger sequences) that must elapse
+        /// between an upgrade proposal and its execution.
+        UpgradeTimelock,
+        /// Waitlist for a course - ordered list of student addresses waiting for enrollment
+        CourseWaitlist(String),
+        /// Global registry of all instructor addresses who have registered courses
+        InstructorRegistry,
+        /// Archived course records by course ID, stored to enforce cooldown
+        /// period before the same course ID can be re-registered.
+        ArchivedCourse(String),
+        /// Configurable challenge period (in ledger sequences) after which
+        /// a pending certificate revocation becomes permanent.
+        RevocationChallengePeriod,
+        /// Ordered (append-only) list of certificate IDs issued for a course.
+        /// Populated by `issue_certificate` and consumed by course-wide bulk
+        /// operations such as `bulk_revoke_course_certificates()`.
+        CourseCertificates(String),
+        /// Mapping from enrollment_reference (unique ID) to (student, course_id)
+        /// Used by issue_certificate to look up enrollments without a caller-supplied course_id.
+        EnrollmentByRef(String),
+        /// Counter for generating unique enrollment references
+        EnrollmentRefCounter,
+        /// Global registry of approver addresses with course approval authority
+        Approver(Address),
+        /// Ledger sequence when init() was called — used to enforce
+        /// a governance window before approve_course() can be called.
+        InitLedger,
+        /// Ledger sequence of the last successful transfer_admin() call.
+        /// Used to enforce a minimum cooldown between consecutive admin key
+        /// rotations, preventing rapid-rotation attacks after a compromise.
+        LastAdminTransferLedger,
+        /// Per-course consecutive enrollment failure counter.
+        /// Incremented each time enroll_internal() panics due to a token
+        /// transfer failure for a specific course. Reset to 0 on a successful
+        /// enrollment. When the count reaches CIRCUIT_BREAKER_THRESHOLD the
+        /// course is automatically paused.
+        CourseFailureCount(String),
+        /// Tokens classified as BTC/ETH-denominated for risk-surcharge pricing.
+        BtcEthToken(Address),
+        /// Lifetime enrollment count per student (new-customer risk flag).
+        StudentEnrollmentCount(Address),
+    }
 }
+
+contract_data_key! {
+    /// Overflow keys split out of `DataKey` to stay below the 50-variant XDR
+    /// limit.
+    ///
+    /// # Variant budget
+    ///
+    /// Current usage: **2 / 50 variants, 48 headroom**.
+    ///
+    /// Use this enum only for *singleton* keys after `DataKey` is full. New
+    /// *composite* keys must use a standalone `#[contracttype]` key struct so
+    /// they do not consume budget here; see `docs/storage-keys.md`.
+    pub enum DataKey2 {
+        /// Threshold price (in stroops) above which a course is "high-value"
+        /// and requires co-signature from two different admins to approve
+        HighValueCourseThreshold,
+        /// Stores the first approver's address for a high-value course pending co-signature
+        HighValueCourseApproval(String),
+    }
+}
+
+// Fail the build as soon as either storage-key enum outgrows its XDR budget.
+const _: () = assert!(DataKey::VARIANT_COUNT <= DATA_KEY_VARIANT_LIMIT);
+const _: () = assert!(DataKey2::VARIANT_COUNT <= DATA_KEY_VARIANT_LIMIT);
 
 /// A proposed contract code upgrade awaiting its governance time-lock.
 #[contracttype]
@@ -1171,8 +1281,7 @@ impl SorobanLardContract {
         if let Some(threshold_val) = threshold {
             if course.price >= threshold_val {
                 let approval_key = DataKey2::HighValueCourseApproval(course_id.clone());
-                let prior_approver: Option<Address> =
-                    env.storage().instance().get(&approval_key);
+                let prior_approver: Option<Address> = env.storage().instance().get(&approval_key);
                 match prior_approver {
                     None => {
                         // Record first approval and return — need a second admin
@@ -4443,6 +4552,24 @@ impl SorobanLardContract {
             panic!("already marked as completed");
         }
 
+        // Refund requests and arbitration cases are mutually exclusive while
+        // either is still active for the same (student, course_id) pair.
+        // Without this guard a student could pursue both paths at once and
+        // receive conflicting resolutions for the same enrollment.
+        let arbitration_key = ArbitrationCaseKey {
+            caller: student.clone(),
+            course_id: course_id.clone(),
+        };
+        if let Some(case) = env
+            .storage()
+            .persistent()
+            .get::<ArbitrationCaseKey, ArbitrationCase>(&arbitration_key)
+        {
+            if case.status == DisputeStatus::Open {
+                panic!("arbitration case open for this dispute");
+            }
+        }
+
         let refund_window = env
             .storage()
             .instance()
@@ -5737,6 +5864,11 @@ impl SorobanLardContract {
     /// arbitration fee (set via `set_arbitration_fee_config`).
     /// The fee is transferred from the caller to the contract and held
     /// until the arbitration is resolved.
+    ///
+    /// An open refund request for the same `(caller, course_id)` pair blocks
+    /// escalation. The two conflict-resolution paths are mutually exclusive
+    /// while either is active, which prevents a student from double-dipping or
+    /// producing conflicting on-chain state for one enrollment.
     pub fn escalate_to_arbitration(env: Env, caller: Address, course_id: String) {
         caller.require_auth();
 
@@ -5753,11 +5885,28 @@ impl SorobanLardContract {
         let course = Self::get_course_internal(&env, &course_id)
             .unwrap_or_else(|| panic!("course not found"));
 
+        // An informal refund request must be resolved (approved or rejected)
+        // before the same dispute can move to formal arbitration. This keeps
+        // request_refund()/process_refund() and escalate_to_arbitration() from
+        // both being active for the same (caller, course_id).
+        let refund_key = DataKey::RefundRequest(caller.clone(), course_id.clone());
+        if let Some(refund) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, RefundRequest>(&refund_key)
+        {
+            if refund.status == RefundStatus::Pending {
+                panic!("refund request pending for this dispute");
+            }
+        }
+
         // Reject duplicate open cases for the same (caller, course_id) pair.
-        let case_key = ArbitrationCaseKey { caller: caller.clone(), course_id: course_id.clone() };
+        let case_key = ArbitrationCaseKey {
+            caller: caller.clone(),
+            course_id: course_id.clone(),
+        };
         if env.storage().persistent().has(&case_key) {
-            let existing: ArbitrationCase =
-                env.storage().persistent().get(&case_key).unwrap();
+            let existing: ArbitrationCase = env.storage().persistent().get(&case_key).unwrap();
             if existing.status == DisputeStatus::Open {
                 panic!("arbitration case already open for this dispute");
             }
@@ -5815,6 +5964,11 @@ impl SorobanLardContract {
     /// - `for_student = true`  — refund the fee to the original caller (student won).
     /// - `for_student = false` — transfer the fee to the course instructor (instructor won).
     ///
+    /// Emits [`ArbitrationResolved`] under the `arbitration_resolved` topic.
+    /// The topic also carries the `case_id` and a distinct outcome symbol
+    /// (`resolved_for_student` or `resolved_for_instructor`) so off-chain
+    /// systems can filter by outcome before decoding the payload.
+    ///
     /// Panics if the case does not exist or is not `Open`.
     pub fn resolve_arbitration(
         env: Env,
@@ -5829,7 +5983,10 @@ impl SorobanLardContract {
             .instance()
             .extend_ttl(Self::INSTANCE_TTL_THRESHOLD, Self::INSTANCE_TTL_EXTEND_TO);
 
-        let case_key = ArbitrationCaseKey { caller: caller.clone(), course_id: course_id.clone() };
+        let case_key = ArbitrationCaseKey {
+            caller: caller.clone(),
+            course_id: course_id.clone(),
+        };
         let mut case: ArbitrationCase = env
             .storage()
             .persistent()
@@ -5867,9 +6024,29 @@ impl SorobanLardContract {
             Self::PERSISTENT_TTL_EXTEND_TO,
         );
 
+        let outcome_topic = match case.status {
+            DisputeStatus::ResolvedForStudent => Symbol::new(&env, "resolved_for_student"),
+            DisputeStatus::ResolvedForInstructor => Symbol::new(&env, "resolved_for_instructor"),
+            DisputeStatus::Open => panic!("arbitration case is not open"),
+        };
+        let event = ArbitrationResolved {
+            case_id: case.case_id.clone(),
+            course_id: case.course_id.clone(),
+            caller: case.caller.clone(),
+            instructor: case.instructor.clone(),
+            outcome: case.status.clone(),
+            fee_paid: case.fee_paid,
+            resolved_by: admin.clone(),
+            resolved_at_ledger: env.ledger().sequence(),
+        };
+
         env.events().publish(
-            (Symbol::new(&env, "arbitration_resolved"), course_id.clone()),
-            (caller, course_id, for_student, admin),
+            (
+                Symbol::new(&env, "arbitration_resolved"),
+                case.case_id.clone(),
+                outcome_topic,
+            ),
+            event,
         );
     }
 
